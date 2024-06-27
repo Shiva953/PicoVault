@@ -13,6 +13,13 @@ impl Value {
         match self {
             Value::SimpleString(s) => format!("+{}\r\n", s),
             Value::BulkString(s) => format!("${}\r\n{}\r\n", s.chars().count(), s),
+            Value::Array(arr) => {
+                let mut serialized = format!("*{}\r\n", arr.len());
+                for value in arr {
+                    serialized.push_str(&value.serialize());
+                }
+                serialized
+            },
             _ => panic!("Unsupported value for serialize"),
         }
     }
@@ -33,6 +40,7 @@ impl RespHandler{
 
     pub async fn read_value(&mut self) -> Result<Option<Value>>{
         let mut buf = [0; 512];
+        self.stream.flush().await?;
         let read_count = self.stream.read_buf(&mut self.buffer).await?; //async READ using tokio
         if read_count == 0 {
             return Ok(None);
