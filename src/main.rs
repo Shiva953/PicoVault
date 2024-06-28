@@ -4,12 +4,14 @@
 // use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // use tokio::time::{timeout, Duration};
 use core::panic;
-use std::collections::HashMap;
+use std::{collections::HashMap, vec};
 use tokio::net::{TcpListener, TcpStream};
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use resp::Value;
 use std::env;
+use tokio::sync::broadcast::Sender;
+use tokio::sync::{broadcast};
 
 mod resp;
 
@@ -21,7 +23,6 @@ struct ServerInfo {
 
 #[tokio::main]
 async fn main() {
-    //taking the port
     let args: Vec<String> = env::args().collect();
     let mut replica_info: Option<String> = None;
 
@@ -47,6 +48,11 @@ async fn main() {
    
     let listener = TcpListener::bind(address.clone()).await.unwrap(); //listening for connections in the MASTER server
     println!("Listening on port {port}");
+    let (sender, mut receiver) = broadcast::channel::<String>(100);
+    let sender = Arc::new(sender);
+    // now the propagation
+    
+
 
     //checking if replica
     if role == "slave" {
@@ -61,7 +67,7 @@ async fn main() {
                 Ok(sockt) => {
                     println!("Slave Connected to master");
                     let mut handler = resp::RespHandler::new(sockt);
-
+                    
                     // Send PING
                     handler.write_value(Value::BulkString("ping".to_string())).await;
                     // let res = sockt.read(&mut [0; 512]).await.unwrap();
@@ -98,6 +104,9 @@ async fn main() {
                     ])).await;
                     let response = handler.read_value().await.unwrap();
                     println!("Received: {:?}", response.unwrap().serialize().as_str());
+
+                    let received = receiver.recv().await.unwrap();
+                    println!("{:?}", received);
                 }
                 Err(e) => {
                     println!("Failed to connect to master: {}", e);
@@ -106,6 +115,7 @@ async fn main() {
         });
     }
     
+        // for the command replication from master to replica, open up a new channel that sends command from client-master Thread1 -> master-replica Thread2 
         //creating a global k-v store, which gets updated each time a client(prev/new) adds a new (k,v)
         let kv_store: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::<String,String>::new()));
         //HANDLING CONCURRENT CLIENTS, NEW THREAD FOR EACH CLIENTi/SERVER stream
@@ -113,6 +123,7 @@ async fn main() {
         let stream = listener.accept().await; // listener.accept().await ASYNCHRONOUSLY WAITS FOR A NEW CONNECTION, INSTEAD OF AN SYNCHRONOUS ITERATOR LIKE listener.incoming() which takes each new connection and puts inside it
         let mut kv_store = Arc::clone(&kv_store);
         let mut server_store = Arc::clone(&server_info);
+        let sender = sender.clone();
         
         match stream { 
             Ok((stream, _)) => {
@@ -120,7 +131,7 @@ async fn main() {
                 //tried using threadpool and pool.execute, turns out each thread in it was unable to handle ASYNC read/write tasks
                 //the below spawns a new ASYNC THREAD for each new client request to the redis server
                 tokio::spawn(async move{
-                    handle_conn(stream, &mut kv_store, &mut server_store).await;
+                    handle_conn(stream, &mut kv_store, &mut server_store, &sender).await;
                 });
                 
             }
@@ -131,17 +142,20 @@ async fn main() {
     }
 }
 
-async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>, server_store: &mut Arc<std::sync::Mutex<ServerInfo>>) {
+async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>, server_store: &mut Arc<std::sync::Mutex<ServerInfo>>, sender: &Arc<Sender<String>>) {
     let mut handler = resp::RespHandler::new(stream);
+    // let (sender, receiver) = broadcast::channel::<String>(100);
     loop{
         let value = handler.read_value().await.unwrap(); //ALL PARSING HAPPENS IN THS FUNCTION 
-        println!("{:?}", value.as_ref().unwrap_or(&Value::SimpleString("Unknown Value".to_string())));
+        // println!("{:?}", value.as_ref().unwrap_or(&Value::SimpleString("Unknown Value".to_string())));
         
-        let res = if let Some(v) = value {
+        let res = if let Some(v) = value.clone() {
             
             //this kinda assumes that whatever value must be coming must be a command
             let (command, args) = extract_command(v).unwrap();
-            
+
+            //rdb transfer
+            // After receiving a response to the last command, the tester will expect to receive an empty RDB file from your server.
             match command.as_str().to_lowercase().as_str() {
                 "ping" => Value::SimpleString("PONG".to_string()),
                 "echo" => args.first().unwrap().clone(),
@@ -149,14 +163,20 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<std::sync::Mutex<Hash
                 "get" => {get_value_from_key(unpack_bulk_str(args[0].clone()).unwrap(), kv_store)}, //by default, consider a input string as bulk string
                 "info" => {get_info(unpack_bulk_str(args[0].clone()).unwrap(), server_store)},
                 "replconf" => Value::SimpleString("OK".to_string()),
-                "psync" => Value::SimpleString(format!("FULL RESYNC {} 0", server_store.lock().unwrap().master_replid)),
+                "psync" => {
+                    // send an empty RDB file
+                    Value::Array(vec![Value::SimpleString(format!("FULL RESYNC {} 0", server_store.lock().unwrap().master_replid)), Value::BulkString(String::from_utf8_lossy(&hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2").unwrap()).to_string())])
+                },
                 c => panic!("Cannot handle command {}", c),
             }
         } else {
             break;
         };
         handler.write_value(res).await;
+        sender.send(extract_command(value.clone().unwrap()).unwrap().0).unwrap();
+        // handler.write_value(Value::BulkString(extract_command(value.clone().unwrap()).unwrap().0)).await;
     }
+    
 }
 //makes sense to store in a global shared hashmap
 fn store_key_value(key: String, value: String, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>) -> Value{
@@ -177,8 +197,8 @@ fn get_value_from_key(key: String, kv_store: &mut Arc<std::sync::Mutex<HashMap<S
 
 // }
 
-// fn handle_psync() -> Value{
-
+// fn handle_psync(server_store: &mut Arc<std::sync::Mutex<ServerInfo>>) -> Value{
+//     Value::BulkString(String::from_utf8(hex::decode("UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==").unwrap()).unwrap().to_string())
 // }
 
 fn get_info(arg: String, server_store: &mut Arc<std::sync::Mutex<ServerInfo>>) -> Value{
