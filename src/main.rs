@@ -6,7 +6,7 @@
 use core::panic;
 use std::{collections::HashMap, vec};
 use tokio::net::{TcpListener, TcpStream};
-use anyhow::Result;
+use anyhow::{Error, Result};
 use std::sync::{Arc, Mutex};
 use resp::Value;
 use std::env;
@@ -159,8 +159,12 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<std::sync::Mutex<Hash
             match command.as_str().to_lowercase().as_str() {
                 "ping" => Value::SimpleString("PONG".to_string()),
                 "echo" => args.first().unwrap().clone(),
-                "set" => {store_key_value(unpack_bulk_str(args[0].clone()).unwrap(), unpack_bulk_str(args[1].clone()).unwrap(), kv_store)},
-                "get" => {get_value_from_key(unpack_bulk_str(args[0].clone()).unwrap(), kv_store)}, //by default, consider a input string as bulk string
+                "set" => {
+                    store_key_value(args, kv_store).unwrap_or(Value::SimpleString("Can only have 2 arguments!".to_string()))
+                },
+                "get" => {
+                    get_value_from_key(args, kv_store).unwrap_or(Value::SimpleString("Can have only 1 key as argument!".to_string()))
+                }, //by default, consider a input string as bulk string
                 "info" => {get_info(unpack_bulk_str(args[0].clone()).unwrap(), server_store)},
                 "replconf" => Value::SimpleString("OK".to_string()),
                 "psync" => {
@@ -179,17 +183,27 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<std::sync::Mutex<Hash
     
 }
 //makes sense to store in a global shared hashmap
-fn store_key_value(key: String, value: String, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>) -> Value{
+fn store_key_value(args: Vec<Value>, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>) -> Result<Value>{
+    if args.len()!=2 {
+        return Err(Error::msg("Can't have more/less than 2 arguments"));
+    }
+    
+    let key = unpack_bulk_str(args[0].clone()).unwrap();
+    let value = unpack_bulk_str(args[1].clone()).unwrap();
     kv_store.lock().unwrap().insert(key, value);
     println!("{:?}", kv_store.lock().unwrap());
-    Value::SimpleString("OK".to_string())
+    return Ok(Value::SimpleString("OK".to_string()));
 }
 
-fn get_value_from_key(key: String, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>) -> Value{
+fn get_value_from_key(args: Vec<Value>, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>) -> Result<Value>{
+    if args.len()!=1 {
+        return Err(Error::msg("Can have only 1 key as argument!"));
+    }
+    let key = unpack_bulk_str(args[0].clone()).unwrap();
     println!("{:?}", kv_store);
     match kv_store.lock().unwrap().get(&key) {
-        Some(v) => Value::BulkString(v.to_string()),
-        None => Value::SimpleString("(null)".to_string())
+        Some(v) => Ok(Value::BulkString(v.to_string())),
+        None => Ok(Value::SimpleString("(null)".to_string()))
     }
 }
 
