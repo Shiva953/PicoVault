@@ -1,17 +1,12 @@
-// use std::{
-//     io::{Read, Write},
-// };
-// use tokio::io::{AsyncReadExt, AsyncWriteExt};
-// use tokio::time::{timeout, Duration};
 use core::panic;
 use std::{collections::HashMap, vec};
 use tokio::net::{TcpListener, TcpStream};
 use anyhow::{Error, Result};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use resp::Value;
 use std::env;
 use tokio::sync::broadcast::Sender;
-use tokio::sync::{broadcast};
+use tokio::sync::{broadcast, Mutex};
 
 mod resp;
 
@@ -41,7 +36,7 @@ async fn main() {
         replica_info = Some(args[pos + 1].clone());
         role = "slave".to_string();
     }
-    let mut master_ip = None;
+    let mut master_ip = None ;
     let mut master_port = None;
     
     let server_info = Arc::new(Mutex::new(ServerInfo{role: role.clone().to_string(), master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(), master_repl_offset: 0}));
@@ -49,12 +44,7 @@ async fn main() {
     let listener = TcpListener::bind(address.clone()).await.unwrap(); //listening for connections in the MASTER server
     println!("Listening on port {port}");
     let (sender, mut receiver) = broadcast::channel::<String>(100);
-    let sender = Arc::new(sender);
-    // now the propagation
-    
 
-
-    //checking if replica
     if role == "slave" {
         let info = replica_info.unwrap();
         let parts: Vec<&str> = info.split_whitespace().collect();
@@ -68,6 +58,7 @@ async fn main() {
                     println!("Slave Connected to master");
                     let mut handler = resp::RespHandler::new(sockt);
                     
+                    //establishing "handshake"
                     // Send PING
                     handler.write_value(Value::BulkString("ping".to_string())).await;
                     // let res = sockt.read(&mut [0; 512]).await.unwrap();
@@ -105,7 +96,7 @@ async fn main() {
                     let response = handler.read_value().await.unwrap();
                     println!("Received: {:?}", response.unwrap().serialize().as_str());
 
-                    let received = receiver.recv().await.unwrap();
+                    let received = Arc::new(receiver.recv().await);
                     println!("{:?}", received);
                 }
                 Err(e) => {
@@ -142,34 +133,30 @@ async fn main() {
     }
 }
 
-async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>, server_store: &mut Arc<std::sync::Mutex<ServerInfo>>, sender: &Arc<Sender<String>>) {
+async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<tokio::sync::Mutex<HashMap<String, String>>>, server_store: &mut Arc<tokio::sync::Mutex<ServerInfo>>, sender: &Sender<String>) {
     let mut handler = resp::RespHandler::new(stream);
-    // let (sender, receiver) = broadcast::channel::<String>(100);
     loop{
         let value = handler.read_value().await.unwrap(); //ALL PARSING HAPPENS IN THS FUNCTION 
-        // println!("{:?}", value.as_ref().unwrap_or(&Value::SimpleString("Unknown Value".to_string())));
         
         let res = if let Some(v) = value.clone() {
-            
             //this kinda assumes that whatever value must be coming must be a command
             let (command, args) = extract_command(v).unwrap();
-
             //rdb transfer
             // After receiving a response to the last command, the tester will expect to receive an empty RDB file from your server.
             match command.as_str().to_lowercase().as_str() {
                 "ping" => Value::SimpleString("PONG".to_string()),
                 "echo" => args.first().unwrap().clone(),
                 "set" => {
-                    store_key_value(args, kv_store).unwrap_or(Value::SimpleString("Can only have 2 arguments!".to_string()))
+                    store_key_value(args, kv_store).await.unwrap_or(Value::SimpleString("Can only have 2 arguments!".to_string()))
                 },
                 "get" => {
-                    get_value_from_key(args, kv_store).unwrap_or(Value::SimpleString("Can have only 1 key as argument!".to_string()))
+                    get_value_from_key(args, kv_store).await.unwrap_or(Value::SimpleString("Can have only 1 key as argument!".to_string()))
                 }, //by default, consider a input string as bulk string
-                "info" => {get_info(unpack_bulk_str(args[0].clone()).unwrap(), server_store)},
+                "info" => {get_info(unpack_bulk_str(args[0].clone()).unwrap(), server_store).await},
                 "replconf" => Value::SimpleString("OK".to_string()),
                 "psync" => {
                     // send an empty RDB file
-                    Value::Array(vec![Value::SimpleString(format!("FULL RESYNC {} 0", server_store.lock().unwrap().master_replid)), Value::BulkString(String::from_utf8_lossy(&hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2").unwrap()).to_string())])
+                    Value::Array(vec![Value::SimpleString(format!("FULL RESYNC {} 0", server_store.lock().await.master_replid)), Value::BulkString(String::from_utf8_lossy(&hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2").unwrap()).to_string())])
                 },
                 c => panic!("Cannot handle command {}", c),
             }
@@ -177,31 +164,32 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<std::sync::Mutex<Hash
             break;
         };
         handler.write_value(res).await;
+        println!("{:?}", extract_command(value.clone().unwrap()).unwrap().0);
         sender.send(extract_command(value.clone().unwrap()).unwrap().0).unwrap();
         // handler.write_value(Value::BulkString(extract_command(value.clone().unwrap()).unwrap().0)).await;
     }
     
 }
 //makes sense to store in a global shared hashmap
-fn store_key_value(args: Vec<Value>, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>) -> Result<Value>{
+async fn store_key_value(args: Vec<Value>, kv_store: &mut Arc<tokio::sync::Mutex<HashMap<String, String>>>) -> Result<Value>{
     if args.len()!=2 {
         return Err(Error::msg("Can't have more/less than 2 arguments"));
     }
     
     let key = unpack_bulk_str(args[0].clone()).unwrap();
     let value = unpack_bulk_str(args[1].clone()).unwrap();
-    kv_store.lock().unwrap().insert(key, value);
-    println!("{:?}", kv_store.lock().unwrap());
+    kv_store.lock().await.insert(key, value);
+    println!("{:?}", kv_store.lock().await);
     return Ok(Value::SimpleString("OK".to_string()));
 }
 
-fn get_value_from_key(args: Vec<Value>, kv_store: &mut Arc<std::sync::Mutex<HashMap<String, String>>>) -> Result<Value>{
+async fn get_value_from_key(args: Vec<Value>, kv_store: &mut Arc<tokio::sync::Mutex<HashMap<String, String>>>) -> Result<Value>{
     if args.len()!=1 {
         return Err(Error::msg("Can have only 1 key as argument!"));
     }
     let key = unpack_bulk_str(args[0].clone()).unwrap();
     println!("{:?}", kv_store);
-    match kv_store.lock().unwrap().get(&key) {
+    match kv_store.lock().await.get(&key) {
         Some(v) => Ok(Value::BulkString(v.to_string())),
         None => Ok(Value::SimpleString("(null)".to_string()))
     }
@@ -215,12 +203,12 @@ fn get_value_from_key(args: Vec<Value>, kv_store: &mut Arc<std::sync::Mutex<Hash
 //     Value::BulkString(String::from_utf8(hex::decode("UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog==").unwrap()).unwrap().to_string())
 // }
 
-fn get_info(arg: String, server_store: &mut Arc<std::sync::Mutex<ServerInfo>>) -> Value{
+async fn get_info(arg: String, server_store: &mut Arc<tokio::sync::Mutex<ServerInfo>>) -> Value{
     match arg.as_str(){
         "replication" => {
-            let role = server_store.lock().unwrap().role.clone();
-            let x = server_store.lock().unwrap().master_replid.clone();
-            let y = server_store.lock().unwrap().master_repl_offset.clone();
+            let role = server_store.lock().await.role.clone();
+            let x = server_store.lock().await.master_replid.clone();
+            let y = server_store.lock().await.master_repl_offset.clone();
             let info_str = format!(
                 "role:{}\nmaster_replid:{}\nmaster_repl_offset:{}",
                 role,
