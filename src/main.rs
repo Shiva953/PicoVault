@@ -164,7 +164,16 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<tokio::sync::Mutex<Ha
             break;
         };
         handler.write_value(res).await;
-        println!("{:?}", extract_command(value.clone().unwrap()).unwrap().0);
+        // println!("{:?}", extract_command(value.clone().unwrap()).unwrap().0);
+        match value.clone() {
+            Ok(x) => {
+                match extract_command(x){
+                    Ok(y) => {sender.send(y.0).unwrap()},
+                    Err(e) => {println!("{:?}", e)}
+                }
+            },
+            Err(e) => {println!("{:?}", e);}
+        }
         sender.send(extract_command(value.clone().unwrap()).unwrap().0).unwrap();
         // handler.write_value(Value::BulkString(extract_command(value.clone().unwrap()).unwrap().0)).await;
     }

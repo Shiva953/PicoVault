@@ -5,8 +5,8 @@ Minimal Redis-like KV Store Implementation in Rust, using tokio and mutexes. Par
 ### Some features(till now)
 
 - `ECHO, PING`
-- Key-Value Store`[GET, SET]`
+- Key-Value Store `[GET, SET]`
 - `Replica INFO`
-- `REPLICA ➔ MASTER` CONNECTION 
+- `REPLICA ➔ MASTER` Connection 
 - `REPLCONF, PSYNC`
 
