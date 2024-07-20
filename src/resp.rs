@@ -39,7 +39,6 @@ impl RespHandler{
     }
 
     pub async fn read_value(&mut self) -> Result<Option<Value>>{
-        let mut buf = [0; 512];
         self.stream.flush().await?;
         let read_count = self.stream.read_buf(&mut self.buffer).await?; //async READ using tokio
         if read_count == 0 {

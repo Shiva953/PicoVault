@@ -2,7 +2,7 @@ use core::panic;
 use std::{collections::HashMap, vec};
 use tokio::net::{TcpListener, TcpStream};
 use anyhow::{Error, Result};
-use std::sync::{Arc};
+use std::sync::Arc;
 use resp::Value;
 use std::env;
 use tokio::sync::broadcast::Sender;
@@ -96,8 +96,13 @@ async fn main() {
                     let response = handler.read_value().await.unwrap();
                     println!("Received: {:?}", response.unwrap().serialize().as_str());
 
-                    let received = Arc::new(receiver.recv().await);
-                    println!("{:?}", received);
+                    let received = receiver.recv().await;
+                    match received {
+                        Ok(val) => {
+                            println!("Received in channel: {:?}", val);
+                        }
+                        Err(e) => {println!("Couldn't get the sender value!");}
+                    }
                 }
                 Err(e) => {
                     println!("Failed to connect to master: {}", e);
@@ -112,8 +117,11 @@ async fn main() {
         //HANDLING CONCURRENT CLIENTS, NEW THREAD FOR EACH CLIENTi/SERVER stream
         loop{ //INSTEAD OF USING for stream in listener.incoming() and synchronously iterating over each stream, we are asynchronously iterating over each stream till the data from the buffer ends
         let stream = listener.accept().await; // listener.accept().await ASYNCHRONOUSLY WAITS FOR A NEW CONNECTION, INSTEAD OF AN SYNCHRONOUS ITERATOR LIKE listener.incoming() which takes each new connection and puts inside it
-        let mut kv_store = Arc::clone(&kv_store);
-        let mut server_store = Arc::clone(&server_info);
+
+
+        let mut kv_store: Arc<Mutex<HashMap<String, String>>> = Arc::clone(&kv_store);
+        let mut server_store: Arc<Mutex<ServerInfo>> = Arc::clone(&server_info);
+
         let sender = sender.clone();
         
         match stream { 
@@ -140,7 +148,7 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<tokio::sync::Mutex<Ha
         
         let res = if let Some(v) = value.clone() {
             //this kinda assumes that whatever value must be coming must be a command
-            let (command, args) = extract_command(v).unwrap();
+            let (command, args) = extract_command(v).await.unwrap();
             //rdb transfer
             // After receiving a response to the last command, the tester will expect to receive an empty RDB file from your server.
             match command.as_str().to_lowercase().as_str() {
@@ -152,7 +160,10 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<tokio::sync::Mutex<Ha
                 "get" => {
                     get_value_from_key(args, kv_store).await.unwrap_or(Value::SimpleString("Can have only 1 key as argument!".to_string()))
                 }, //by default, consider a input string as bulk string
-                "info" => {get_info(unpack_bulk_str(args[0].clone()).unwrap(), server_store).await},
+                "incr" => {
+                    incr_command(args, kv_store).await.unwrap()
+                },
+                "info" => {get_info(unpack_bulk_str(args[0].clone()).await.unwrap(), server_store).await},
                 "replconf" => Value::SimpleString("OK".to_string()),
                 "psync" => {
                     // send an empty RDB file
@@ -166,15 +177,20 @@ async fn handle_conn(stream: TcpStream, kv_store: &mut Arc<tokio::sync::Mutex<Ha
         handler.write_value(res).await;
         // println!("{:?}", extract_command(value.clone().unwrap()).unwrap().0);
         match value.clone() {
-            Ok(x) => {
-                match extract_command(x){
-                    Ok(y) => {sender.send(y.0).unwrap()},
+            Some(x) => {
+                match extract_command(x).await{
+                    Ok(y) => {
+                        match sender.send(y.0){
+                            Ok(val) => {println!("{val}");},
+                            Err(e) => { println!("Unable to Send Value, No receiving end!"); }
+                        };
+                    },
                     Err(e) => {println!("{:?}", e)}
                 }
             },
-            Err(e) => {println!("{:?}", e);}
+            None => {println!("Command Not Found!");}
         }
-        sender.send(extract_command(value.clone().unwrap()).unwrap().0).unwrap();
+        // sender.send(extract_command(value.clone().unwrap()).unwrap().0).unwrap();
         // handler.write_value(Value::BulkString(extract_command(value.clone().unwrap()).unwrap().0)).await;
     }
     
@@ -185,8 +201,8 @@ async fn store_key_value(args: Vec<Value>, kv_store: &mut Arc<tokio::sync::Mutex
         return Err(Error::msg("Can't have more/less than 2 arguments"));
     }
     
-    let key = unpack_bulk_str(args[0].clone()).unwrap();
-    let value = unpack_bulk_str(args[1].clone()).unwrap();
+    let key = unpack_bulk_str(args[0].clone()).await.unwrap();
+    let value = unpack_bulk_str(args[1].clone()).await.unwrap();
     kv_store.lock().await.insert(key, value);
     println!("{:?}", kv_store.lock().await);
     return Ok(Value::SimpleString("OK".to_string()));
@@ -196,11 +212,45 @@ async fn get_value_from_key(args: Vec<Value>, kv_store: &mut Arc<tokio::sync::Mu
     if args.len()!=1 {
         return Err(Error::msg("Can have only 1 key as argument!"));
     }
-    let key = unpack_bulk_str(args[0].clone()).unwrap();
+    let key = unpack_bulk_str(args[0].clone()).await.unwrap();
     println!("{:?}", kv_store);
     match kv_store.lock().await.get(&key) {
         Some(v) => Ok(Value::BulkString(v.to_string())),
         None => Ok(Value::SimpleString("(null)".to_string()))
+    }
+}
+
+async fn incr_command(args: Vec<Value>, kv_store: &mut Arc<tokio::sync::Mutex<HashMap<String, String>>>) -> Result<Value>{
+    //1. key exits && value exists as integer -> incr by 1
+    //2. key DNE -> set value as 1
+    //3. key exists && value is not integer -> ERR(val not integer)
+
+    let mut store = kv_store.lock().await;
+    match unpack_bulk_str(args[0].clone()).await{
+        Ok(k) => {
+            //if key exists, then value would by-default exist
+            // but value can be integer/non-integer
+            match store.get(&k) {
+                Some(v) => {
+                    match v.parse::<i32>() {
+                        Ok(val) => {
+                            store.insert(k, (val+1).to_string()).unwrap();
+                            Ok(Value::SimpleString((val+1).to_string()))
+                        },
+                        Err(e) => {
+                            Ok(Value::BulkString("(error) ERR value is not an integer or out of range".to_string()))
+                        }
+                    }
+                },
+                None => {
+                    store.insert(k, "1".to_string());
+                    Ok(Value::SimpleString("1".to_string()))
+                }
+            }
+        },
+        Err(e) => {
+            Err(Error::msg("Unable to parse key!"))
+        }
     }
 }
 
@@ -216,13 +266,13 @@ async fn get_info(arg: String, server_store: &mut Arc<tokio::sync::Mutex<ServerI
     match arg.as_str(){
         "replication" => {
             let role = server_store.lock().await.role.clone();
-            let x = server_store.lock().await.master_replid.clone();
-            let y = server_store.lock().await.master_repl_offset.clone();
+            let replid = server_store.lock().await.master_replid.clone();
+            let repl_offset = server_store.lock().await.master_repl_offset.clone();
             let info_str = format!(
                 "role:{}\nmaster_replid:{}\nmaster_repl_offset:{}",
                 role,
-                x,
-                y
+                replid,
+                repl_offset
             );
             Value::BulkString(info_str)
         },
@@ -232,11 +282,11 @@ async fn get_info(arg: String, server_store: &mut Arc<tokio::sync::Mutex<ServerI
 
 //extracting the command used after redis-cli, along with the args after the command[redis-cli <command> [..args]]
 // returning (command, [..args])
-fn extract_command(value: Value) -> Result<(String, Vec<Value>)> {
+async fn extract_command(value: Value) -> Result<(String, Vec<Value>)> {
     match value {
         Value::Array(a) => { //[command, ..arguments]
             Ok((
-                unpack_bulk_str(a.first().unwrap().clone())?, //command 
+                unpack_bulk_str(a.first().unwrap().clone()).await?, //command 
                 a.into_iter().skip(1).collect(), //[..arguments]
             ))
         },
@@ -249,7 +299,7 @@ fn extract_command(value: Value) -> Result<(String, Vec<Value>)> {
         _ => Err(anyhow::anyhow!("Unexpected command format")),
     }
 }
-fn unpack_bulk_str(value: Value) -> Result<String> {
+async fn unpack_bulk_str(value: Value) -> Result<String> {
     match value {
         Value::BulkString(s) => Ok(s),
         _ => Err(anyhow::anyhow!("Expected command to be a bulk string"))
